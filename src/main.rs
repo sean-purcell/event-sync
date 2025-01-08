@@ -3,8 +3,9 @@ extern crate diesel;
 #[macro_use]
 extern crate diesel_migrations;
 
+use chrono::{DateTime, Utc};
 use eyre::{Report, Result, WrapErr};
-use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use google_calendar3::{api::Event, CalendarHub};
 use log::LevelFilter;
 use structopt::StructOpt;
@@ -78,20 +79,28 @@ struct List {
     num: usize,
 }
 
+fn list_events(
+    hub: &CalendarHub, calendar: &str, updated_after: Option<DateTime<Utc>>,
+) -> impl Stream<Item = Result<Event, Report>> {
+    page_iterator::stream_items(move |next_page_token| async move {
+        let req = hub.events().list(calendar);
+        let req = match next_page_token {
+            Some(token) => req.page_token(token.as_str()),
+            None => req,
+        };
+        let req = match updated_after {
+            Some(updated_min) => req.updated_min(updated_min.to_rfc3339().as_str()),
+            None => req,
+        };
+        let (_body, response) = req.doit().await?;
+        
+        Ok::<_, Report>((response.items.unwrap_or(vec![]), response.next_page_token))
+    }, |items| items)
+}
+
 impl List {
     async fn run(&self, hub: CalendarHub) -> Result<()> {
-        let hub = &hub;
-        let calendar = self.calendar.as_str();
-        let iter = page_iterator::stream_items(move |next_page_token| async move {
-            let req = hub.events().list(calendar);
-            let req = match next_page_token {
-                Some(token) => req.page_token(token.as_str()),
-                None => req,
-            };
-            let (_body, response) = req.doit().await?;
-            
-            Ok::<_, Report>((response.items.unwrap_or(vec![]), response.next_page_token))
-        }, |items| items);
+        let iter = list_events(&hub, self.calendar.as_str(), None);
         iter.take(self.num)
             .try_for_each(|item| async move {
                 println!("{}", serde_json::to_string(&item).unwrap());
@@ -104,9 +113,37 @@ impl List {
 }
 
 #[derive(Debug, StructOpt)]
+struct Sync {
+    #[structopt(
+        long = "src",
+        help = "Source calendar ID",
+    )]
+    src: String,
+    #[structopt(
+        long = "dst",
+        help = "Destination calendar ID",
+    )]
+    dst: String,
+    #[structopt(
+        short = "u",
+        long = "updated-after",
+        help = "Only events updated after this time",
+    )]
+    updated_after: DateTime<Utc>,
+}
+
+impl Sync {
+    async fn run(&self, hub: CalendarHub) -> Result<()> {
+        let src_events = list_events(&hub.clone(), self.src.as_str(), Some(self.updated_after.clone()));
+        Ok(())
+    }
+}
+
+#[derive(Debug, StructOpt)]
 enum Cmd {
     List(List),
     ListCalendars(ListCalendars),
+    Sync(Sync),
 }
 
 #[derive(Debug, StructOpt)]
@@ -142,6 +179,7 @@ async fn main() -> Result<()> {
     match args.cmd {
         Cmd::List(list) => list.run(hub).await?,
         Cmd::ListCalendars(list) => list.run(hub).await?,
+        Cmd::Sync(sync) => sync.run(hub).await?,
     }
 
     Ok(())
