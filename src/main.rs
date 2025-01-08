@@ -6,7 +6,9 @@ extern crate diesel_migrations;
 use chrono::{DateTime, Utc};
 use eyre::{Report, Result, WrapErr};
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use google_apis_common::Connector;
 use google_calendar3::{api::Event, CalendarHub};
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use log::LevelFilter;
 use structopt::StructOpt;
 use yup_oauth2::{
@@ -37,7 +39,7 @@ struct ListCalendars {
 }
 
 impl ListCalendars {
-    async fn run(&self, hub: CalendarHub) -> Result<()> {
+    async fn run<C>(&self, hub: CalendarHub<C>) -> Result<()> where C: Connector {
         let hub = &hub;
         let iter = page_iterator::stream_items(
             move |next_page_token| async move {
@@ -79,9 +81,9 @@ struct List {
     num: usize,
 }
 
-fn list_events(
-    hub: &CalendarHub, calendar: &str, updated_after: Option<DateTime<Utc>>,
-) -> impl Stream<Item = Result<Event, Report>> {
+fn list_events<'a, C>(
+    hub: &'a CalendarHub<C>, calendar: &'a str, updated_after: Option<DateTime<Utc>>,
+) -> impl 'a + Stream<Item = Result<Event, Report>> where C: Connector {
     page_iterator::stream_items(move |next_page_token| async move {
         let req = hub.events().list(calendar);
         let req = match next_page_token {
@@ -89,7 +91,7 @@ fn list_events(
             None => req,
         };
         let req = match updated_after {
-            Some(updated_min) => req.updated_min(updated_min.to_rfc3339().as_str()),
+            Some(updated_min) => req.updated_min(updated_min),
             None => req,
         };
         let (_body, response) = req.doit().await?;
@@ -99,7 +101,7 @@ fn list_events(
 }
 
 impl List {
-    async fn run(&self, hub: CalendarHub) -> Result<()> {
+    async fn run<C>(&self, hub: CalendarHub<C>) -> Result<()> where C: Connector {
         let iter = list_events(&hub, self.calendar.as_str(), None);
         iter.take(self.num)
             .try_for_each(|item| async move {
@@ -133,8 +135,9 @@ struct Sync {
 }
 
 impl Sync {
-    async fn run(&self, hub: CalendarHub) -> Result<()> {
-        let src_events = list_events(&hub.clone(), self.src.as_str(), Some(self.updated_after.clone()));
+    async fn run<C>(&self, hub: CalendarHub<C>) -> Result<()> where C: Connector {
+        let hub2 = hub.clone();
+        let src_events = list_events(&hub2, self.src.as_str(), Some(self.updated_after.clone()));
         Ok(())
     }
 }
@@ -171,8 +174,13 @@ async fn main() -> Result<()> {
         .await
         .wrap_err("Failed to get authenticator")?;
 
-    let https = hyper_rustls::HttpsConnector::with_native_roots();
-    let client = hyper::Client::builder().build(https);
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .unwrap()
+        .https_or_http()
+        .enable_http1()
+        .build();
+    let client = Client::builder(TokioExecutor::new()).build(https);
 
     let hub = CalendarHub::new(client, authenticator);
 
