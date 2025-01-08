@@ -1,9 +1,7 @@
-use std::borrow::Borrow;
 use std::future::Future;
 
 use futures::{
-    future::{BoxFuture, FutureExt},
-    stream::{self, Stream},
+    stream::{self, Stream, StreamExt, TryStreamExt},
 };
 
 enum State {
@@ -35,4 +33,19 @@ where
             }
         }
     })
+}
+
+pub fn stream_items<'a, F, I, Fut, E, Page, Item>(
+    fetch_page: F,
+    to_items: I,
+) -> impl 'a + Stream<Item = Result<Item, E>>
+where
+    F: 'a + Fn(Option<String>) -> Fut + Send + Sync,
+    I: 'a + Fn(Page) -> Vec<Item> + Send + Sync,
+    Fut: Future<Output = Result<(Page, Option<String>), E>>,
+    Page: Send + 'static
+{
+    stream_pages(fetch_page)
+        .map_ok(move |page| { stream::iter(to_items(page)).map(|x| Ok::<_, E>(x) )})
+        .try_flatten()
 }
