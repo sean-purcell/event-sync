@@ -4,7 +4,7 @@ use chrono::{DateTime, FixedOffset, Utc};
 use eyre::{eyre, Report, Result, WrapErr};
 use futures::stream::{Stream, StreamExt, TryStreamExt};
 use google_apis_common::Connector;
-use google_calendar3::{api::{Event, EventDateTime}, CalendarHub};
+use google_calendar3::{api::{Event, EventDateTime, EventListCall}, CalendarHub};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use log::LevelFilter;
 use structopt::StructOpt;
@@ -78,19 +78,26 @@ struct List {
     num: usize,
 }
 
+fn maybe_update_req<R, V>(req: R, val: Option<V>, f: impl FnOnce(R, V) -> R) -> R {
+    if let Some(v) = val {
+        f(req, v)
+    } else {
+        req
+    }
+}
+
 fn list_events<'a, C>(
-    hub: &'a CalendarHub<C>, calendar: &'a str, updated_after: Option<DateTime<Utc>>,
-) -> impl 'a + Stream<Item = Result<Event, Report>> where C: Connector {
+    hub: &'a CalendarHub<C>, calendar: &'a str,
+    updated_after: Option<DateTime<Utc>>,
+    time_min: Option<DateTime<Utc>>,
+) -> impl 'a + Stream<Item = Result<Event, Report>> 
+where
+    C: Connector {
     page_iterator::stream_items(move |next_page_token| async move {
         let req = hub.events().list(calendar);
-        let req = match next_page_token {
-            Some(token) => req.page_token(token.as_str()),
-            None => req,
-        };
-        let req = match updated_after {
-            Some(updated_min) => req.updated_min(updated_min),
-            None => req,
-        };
+        let req = maybe_update_req(req, next_page_token, |req, token| req.page_token(token.as_str()));
+        let req = maybe_update_req(req, updated_after, |req, updated_after| req.updated_min(updated_after));
+        let req = maybe_update_req(req, time_min, |req, time_min| req.time_min(time_min));
         let (_body, response) = req.doit().await?;
         
         Ok::<_, Report>((response.items.unwrap_or(vec![]), response.next_page_token))
@@ -99,7 +106,7 @@ fn list_events<'a, C>(
 
 impl List {
     async fn run<C>(&self, hub: CalendarHub<C>) -> Result<()> where C: Connector {
-        let iter = list_events(&hub, self.calendar.as_str(), None);
+        let iter = list_events(&hub, self.calendar.as_str(), None, None);
         iter.take(self.num)
             .try_for_each(|item| async move {
                 println!("{}", serde_json::to_string(&item).unwrap());
@@ -128,7 +135,13 @@ struct Sync {
         long = "updated-after",
         help = "Only events updated after this time",
     )]
-    updated_after: DateTime<Utc>,
+    updated_after: Option<DateTime<FixedOffset>>,
+    #[structopt(
+        short = "a",
+        long = "after",
+        help = "Only events after this time",
+    )]
+    starting_after: Option<DateTime<FixedOffset>>,
     #[structopt(
         long = "colour-id",
         help = "Colour ID for created event",
@@ -144,11 +157,13 @@ struct Sync {
 const SRC_ID_KEY: &'static str = "event-sync-src-id";
 
 impl Sync {
-    async fn run<C>(&self, hub: CalendarHub<C>) -> Result<()> where C: Connector {
+    async fn run<'a, C>(&self, hub: CalendarHub<C>) -> Result<()> where C: Connector {
         let hub1 = hub.clone();
         let hub2 = hub.clone();
-        let src_events = list_events(&hub1, self.src.as_str(), Some(self.updated_after.clone()));
-        let dst_events = list_events(&hub2, self.dst.as_str(), Some(self.updated_after.clone()));
+        let updated_after = self.updated_after.map(|x| x.to_utc());
+        let starting_after = self.starting_after.map(|x| x.to_utc());
+        let src_events = list_events(&hub1, self.src.as_str(), updated_after.clone(), starting_after.clone());
+        let dst_events = list_events(&hub2, self.dst.as_str(), updated_after.clone(), starting_after.clone());
 
         let dst_events_by_src_id = dst_events
             .try_filter_map(|event| async move {
