@@ -1,13 +1,10 @@
-#[macro_use]
-extern crate diesel;
-#[macro_use]
-extern crate diesel_migrations;
+use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
-use eyre::{Report, Result, WrapErr};
-use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use chrono::{DateTime, FixedOffset, Utc};
+use eyre::{eyre, Report, Result, WrapErr};
+use futures::stream::{Stream, StreamExt, TryStreamExt};
 use google_apis_common::Connector;
-use google_calendar3::{api::Event, CalendarHub};
+use google_calendar3::{api::{Event, EventDateTime}, CalendarHub};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use log::LevelFilter;
 use structopt::StructOpt;
@@ -132,12 +129,140 @@ struct Sync {
         help = "Only events updated after this time",
     )]
     updated_after: DateTime<Utc>,
+    #[structopt(
+        long = "colour-id",
+        help = "Colour ID for created event",
+    )]
+    colour_id: Option<String>,
+    #[structopt(
+        long = "dry-run",
+        help = "Don't actually create events",
+    )]
+    dry_run: bool,
 }
+
+const SRC_ID_KEY: &'static str = "event-sync-src-id";
 
 impl Sync {
     async fn run<C>(&self, hub: CalendarHub<C>) -> Result<()> where C: Connector {
+        let hub1 = hub.clone();
         let hub2 = hub.clone();
-        let src_events = list_events(&hub2, self.src.as_str(), Some(self.updated_after.clone()));
+        let src_events = list_events(&hub1, self.src.as_str(), Some(self.updated_after.clone()));
+        let dst_events = list_events(&hub2, self.dst.as_str(), Some(self.updated_after.clone()));
+
+        let dst_events_by_src_id = dst_events
+            .try_filter_map(|event| async move {
+                log::debug!("{}", serde_json::to_string(&event).unwrap());
+                let src_id = event
+                    .extended_properties
+                    .as_ref()
+                    .and_then(|x| x.shared.as_ref())
+                    .and_then(|m| m.get(SRC_ID_KEY).cloned());
+
+                match src_id {
+                    None => Ok(None),
+                    Some(id) => Ok(Some((id.clone(), event))),
+                }
+            })
+            .try_collect::<HashMap<String, Event>>()
+            .await?;
+
+        let hub = &hub;
+
+        let dst_events_by_src_id = &dst_events_by_src_id;
+        src_events
+            .try_for_each(|src_event| async move {
+                // TODO: Handle updates
+                let id = src_event.id.ok_or(eyre!("Event missing id"))?;
+                let existing = dst_events_by_src_id.get(&id);
+                match existing {
+                    Some(existing) => {
+                        log::info!("Ignoring {} because a matching event already exists: {:?}", id, existing.id);
+                        Ok(())
+                    }
+                    None => {
+                        let mut properties = src_event.extended_properties.clone();
+                        let props = properties.get_or_insert_with(|| Default::default());
+                        let shared = props.shared.get_or_insert_with(|| Default::default());
+                        shared.insert(SRC_ID_KEY.to_string(), id.clone());
+
+                        let dst_event = Event {
+                            summary: src_event.summary.clone(),
+                            location: src_event.location.clone(),
+                            start: src_event.start.clone(),
+                            end: src_event.end.clone(),
+                            extended_properties: properties,
+                            color_id: self.colour_id.clone(),
+
+                            ..Default::default()
+                        };
+
+                        log::info!("Inserting event for {}: {}", &id, serde_json::to_string(&dst_event).unwrap());
+                        if !self.dry_run {
+                            hub.events()
+                                .insert(dst_event, &self.dst)
+                                .add_scope(google_calendar3::api::Scope::Event)
+                                .doit()
+                                .await?;
+                        }
+
+                        Ok(())
+                    }
+                }
+            })
+            .await?;
+
+        Ok(())
+    }
+}
+#[derive(Debug, StructOpt)]
+struct ImportEvent {
+    #[structopt(
+        short = "c",
+        long = "calendar",
+        help = "Calendar ID",
+        default_value = "primary"
+    )]
+    calendar: String,
+    #[structopt(
+        short = "i",
+        long = "ical-uid",
+        help = "ID of event to import",
+    )]
+    ical_uid: String,
+    #[structopt(
+        long = "start",
+        help = "Start time of event",
+    )]
+    start: DateTime<FixedOffset>,
+    #[structopt(
+        long = "end",
+        help = "End time of event",
+    )]
+    end: DateTime<FixedOffset>,
+}
+
+impl ImportEvent {
+    async fn run<C>(&self, hub: CalendarHub<C>) -> Result<()> where C: Connector {
+        let event = Event {
+            i_cal_uid: Some(self.ical_uid.clone()),
+            start: Some(EventDateTime {
+                date_time: Some(self.start.to_utc()),
+                ..Default::default()
+            }),
+            end: Some(EventDateTime {
+                date_time: Some(self.end.to_utc()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        hub
+            .events()
+            .import(event, &self.calendar)
+            .add_scope(google_calendar3::api::Scope::Event)
+            .doit()
+            .await?;
         Ok(())
     }
 }
@@ -147,6 +272,7 @@ enum Cmd {
     List(List),
     ListCalendars(ListCalendars),
     Sync(Sync),
+    ImportEvent(ImportEvent),
 }
 
 #[derive(Debug, StructOpt)]
@@ -161,6 +287,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     env_logger::Builder::new()
         .filter_level(LevelFilter::Info)
         .parse_default_env()
@@ -188,6 +316,7 @@ async fn main() -> Result<()> {
         Cmd::List(list) => list.run(hub).await?,
         Cmd::ListCalendars(list) => list.run(hub).await?,
         Cmd::Sync(sync) => sync.run(hub).await?,
+        Cmd::ImportEvent(import) => import.run(hub).await?,
     }
 
     Ok(())

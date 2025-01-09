@@ -551,6 +551,7 @@ dependencies = [
  "hyper-util",
  "log",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "structopt",

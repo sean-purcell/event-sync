@@ -12,6 +12,7 @@ struct Opt {
     #[structopt(
         short = "s",
         long = "scope",
+        default_value = "https://www.googleapis.com/auth/calendar.events"
     )]
     scopes: Vec<String>,
     #[structopt(short = "o", long = "output")]
