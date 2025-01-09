@@ -4,7 +4,7 @@ use chrono::{DateTime, FixedOffset, Utc};
 use eyre::{eyre, Report, Result, WrapErr};
 use futures::stream::{Stream, StreamExt, TryStreamExt};
 use google_apis_common::Connector;
-use google_calendar3::{api::{Event, EventDateTime, EventListCall}, CalendarHub};
+use google_calendar3::{api::{Event, EventDateTime}, CalendarHub};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use log::LevelFilter;
 use structopt::StructOpt;
@@ -90,6 +90,8 @@ fn list_events<'a, C>(
     hub: &'a CalendarHub<C>, calendar: &'a str,
     updated_after: Option<DateTime<Utc>>,
     time_min: Option<DateTime<Utc>>,
+    // TODO: Determine how to express the above filters as a function from EventListCall ->
+    // EventListCall. I can't make the lifetimes work...
 ) -> impl 'a + Stream<Item = Result<Event, Report>> 
 where
     C: Connector {
